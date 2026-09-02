@@ -1,0 +1,5 @@
+*.pyc
+*-checkpoint*
+test_beltrami
+plots
+*.vts

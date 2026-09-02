@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fit an NCSX Beltrami surface with evosax CMA-ES.
+"""Fit an NCSX surface with evosax CMA-ES.
+
+By default (``DUMMY=True``) optimizes ``SurfaceXYZFourierJAX`` dofs as a
+sanity check that the surface-surface distance objective behaves. Set
+``DUMMY=False`` to optimize ``SurfaceBeltramiJAX`` instead.
 
 Run with the ``desc`` conda env (GPU JAX + evosax 0.2)::
 
@@ -18,7 +22,7 @@ import numpy as np
 from simsopt import load
 
 from evosax.algorithms import CMA_ES
-from quadcoil.surface import SurfaceJAX
+from quadcoil.surface import SurfaceJAX, SurfaceXYZFourierJAX
 from surface_distance import surface_surface_distance
 from surface_transport import SurfaceBeltramiJAX
 from utils import to_vtk
@@ -28,7 +32,10 @@ from utils import to_vtk
 # ---------------------------------------------------------------------------
 
 NCSX_PATH = Path("ncsx.json")
-OUTDIR = Path("runs/beltrami_cma")
+# When True, CMA-ES optimizes SurfaceXYZFourierJAX (fast objective check).
+# When False, optimizes SurfaceBeltramiJAX.
+DUMMY = True
+OUTDIR = Path("runs/xyz_fourier_cma" if DUMMY else "runs/beltrami_cma")
 
 POPSIZE = 200
 N_GEN = 100
@@ -41,6 +48,10 @@ EVAL_MODE = "vmap"
 N_PHI = 16
 N_THETA = 16
 QUAD_N = 16  # surface quadpoints per field period
+# Dummy (XYZ Fourier) resolution.
+DUMMY_MPOL = 4
+DUMMY_NTOR = 4
+# Beltrami-only knobs (ignored when DUMMY=True).
 STEP_NUM = 10
 M_PER_PERIOD = 3
 MIN_LAM = 1e-5
@@ -55,9 +66,21 @@ POLISH = True
 SAVE_EVERY = 0
 
 
+def _circular_torus_gamma(major: float, minor: float, phi: jnp.ndarray, theta: jnp.ndarray):
+    """Axisymmetric circular torus on a (phi, theta) meshgrid (ij indexing)."""
+    phi_rad = 2.0 * jnp.pi * phi
+    theta_rad = 2.0 * jnp.pi * theta
+    R = major + minor * jnp.cos(theta_rad)
+    Z = minor * jnp.sin(theta_rad)
+    X = R * jnp.cos(phi_rad)
+    Y = R * jnp.sin(phi_rad)
+    return jnp.stack([X, Y, Z], axis=-1)
+
+
 def main() -> None:
     jax.config.update("jax_enable_x64", True)
     print(f"jax {jax.__version__}  backend={jax.default_backend()}  devices={jax.devices()}")
+    print(f"DUMMY={DUMMY}  OUTDIR={OUTDIR}")
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,76 +92,114 @@ def main() -> None:
     )
     major = float(simsopt_surface.major_radius())
     nfp = int(simsopt_surface.nfp)
+    stellsym = bool(simsopt_surface.stellsym)
     print(f"NCSX nfp={nfp}  R0={major:.4f}  a={minor:.4f}")
 
-    box_r = major + 2.0 * minor
-    box_z = 4.0 * minor
+    quad_phi = jnp.linspace(0.0, 1.0 / nfp, QUAD_N, endpoint=False)
+    quad_theta = jnp.linspace(0.0, 1.0, QUAD_N, endpoint=False)
 
-    init_surface_b = SurfaceBeltramiJAX(
-        nfp=nfp,
-        stellsym=bool(simsopt_surface.stellsym),
-        seed_major_radius=major,
-        seed_minor_radius=minor,
-        quadpoints_phi=jnp.linspace(0.0, 1.0 / nfp, QUAD_N, endpoint=False),
-        quadpoints_theta=jnp.linspace(0.0, 1.0, QUAD_N, endpoint=False),
-        step_num=STEP_NUM,
-        m_per_period=M_PER_PERIOD,
-        min_lam=MIN_LAM,
-        max_lam=MAX_LAM,
-        n_lam=N_LAM,
-        box_r=box_r,
-        box_z=box_z,
-        max_order=MAX_ORDER,
-        max_iter=MAX_ITER,
-        tol=TOL,
-        pi_guard=PI_GUARD,
-        polish=POLISH,
-    )
-    n_dofs = int(init_surface_b.dofs.shape[0])
-    print(
-        f"basis n_modes={n_dofs}  m={init_surface_b.basis.m.tolist()}  "
-        f"radius={init_surface_b.basis.radius:.4f}  "
-        f"step_num={init_surface_b.step_num}  max_order={init_surface_b.max_order}"
-    )
-
-    def make_surface_b(dofs):
-        return SurfaceBeltramiJAX(
-            nfp=init_surface_b.nfp,
-            stellsym=init_surface_b.stellsym,
-            seed_major_radius=init_surface_b.seed_major_radius,
-            seed_minor_radius=init_surface_b.seed_minor_radius,
-            quadpoints_phi=init_surface_b.quadpoints_phi,
-            quadpoints_theta=init_surface_b.quadpoints_theta,
-            step_num=init_surface_b.step_num,
-            m_per_period=init_surface_b.m_per_period,
-            min_lam=init_surface_b.min_lam,
-            max_lam=init_surface_b.max_lam,
-            n_lam=init_surface_b.n_lam,
-            dofs=dofs,
-            box_r=init_surface_b.box_r,
-            box_z=init_surface_b.box_z,
-            max_order=init_surface_b.max_order,
-            max_iter=init_surface_b.max_iter,
-            tol=init_surface_b.tol,
-            pi_guard=init_surface_b.pi_guard,
-            polish=init_surface_b.polish,
+    if DUMMY:
+        # Start from a circular torus in XYZ Fourier form — far from NCSX, so
+        # a working objective should drive fitness down under CMA-ES.
+        phi_mesh, theta_mesh = jnp.meshgrid(quad_phi, quad_theta, indexing="ij")
+        gamma0 = _circular_torus_gamma(major, minor, phi_mesh, theta_mesh)
+        init_surface = SurfaceXYZFourierJAX.fit(
+            phi_target=phi_mesh,
+            theta_target=theta_mesh,
+            gamma_target=gamma0,
+            nfp=nfp,
+            stellsym=stellsym,
+            quadpoints_phi=quad_phi,
+            quadpoints_theta=quad_theta,
+            mpol=DUMMY_MPOL,
+            ntor=DUMMY_NTOR,
+        )
+        n_dofs = int(init_surface.dofs.shape[0])
+        print(
+            f"dummy SurfaceXYZFourierJAX  n_dofs={n_dofs}  "
+            f"mpol={DUMMY_MPOL}  ntor={DUMMY_NTOR}"
         )
 
-    def f_b(dofs):
-        temp_surface = make_surface_b(dofs)
+        def make_surface(dofs):
+            return SurfaceXYZFourierJAX(
+                nfp=init_surface.nfp,
+                stellsym=init_surface.stellsym,
+                mpol=init_surface.mpol,
+                ntor=init_surface.ntor,
+                quadpoints_phi=init_surface.quadpoints_phi,
+                quadpoints_theta=init_surface.quadpoints_theta,
+                dofs=dofs,
+            )
+    else:
+        box_r = major + 2.0 * minor
+        box_z = 4.0 * minor
+        init_surface = SurfaceBeltramiJAX(
+            nfp=nfp,
+            stellsym=stellsym,
+            seed_major_radius=major,
+            seed_minor_radius=minor,
+            quadpoints_phi=quad_phi,
+            quadpoints_theta=quad_theta,
+            step_num=STEP_NUM,
+            m_per_period=M_PER_PERIOD,
+            min_lam=MIN_LAM,
+            max_lam=MAX_LAM,
+            n_lam=N_LAM,
+            box_r=box_r,
+            box_z=box_z,
+            max_order=MAX_ORDER,
+            max_iter=MAX_ITER,
+            tol=TOL,
+            pi_guard=PI_GUARD,
+            polish=POLISH,
+        )
+        n_dofs = int(init_surface.dofs.shape[0])
+        print(
+            f"basis n_modes={n_dofs}  m={init_surface.basis.m.tolist()}  "
+            f"radius={init_surface.basis.radius:.4f}  "
+            f"step_num={init_surface.step_num}  max_order={init_surface.max_order}"
+        )
+
+        def make_surface(dofs):
+            return SurfaceBeltramiJAX(
+                nfp=init_surface.nfp,
+                stellsym=init_surface.stellsym,
+                seed_major_radius=init_surface.seed_major_radius,
+                seed_minor_radius=init_surface.seed_minor_radius,
+                quadpoints_phi=init_surface.quadpoints_phi,
+                quadpoints_theta=init_surface.quadpoints_theta,
+                step_num=init_surface.step_num,
+                m_per_period=init_surface.m_per_period,
+                min_lam=init_surface.min_lam,
+                max_lam=init_surface.max_lam,
+                n_lam=init_surface.n_lam,
+                dofs=dofs,
+                box_r=init_surface.box_r,
+                box_z=init_surface.box_z,
+                max_order=init_surface.max_order,
+                max_iter=init_surface.max_iter,
+                tol=init_surface.tol,
+                pi_guard=init_surface.pi_guard,
+                polish=init_surface.polish,
+            )
+
+    def fitness_one(dofs):
         return surface_surface_distance(
-            target_surface, temp_surface, N_PHI, N_THETA
+            target_surface, make_surface(dofs), N_PHI, N_THETA
         )
+
+    f0 = float(fitness_one(jnp.asarray(init_surface.dofs)))
+    print(f"initial fitness={f0:.6e}")
 
     if EVAL_MODE == "vmap":
-        fitness_fn = jax.jit(jax.vmap(f_b))
+        fitness_fn = jax.jit(jax.vmap(fitness_one))
     elif EVAL_MODE == "map":
         # Peak memory ~ one individual; still jitted once.
-        fitness_fn = jax.jit(lambda pop: jax.lax.map(f_b, pop))
+        fitness_fn = jax.jit(lambda pop: jax.lax.map(fitness_one, pop))
     else:
         raise ValueError(f"EVAL_MODE must be 'vmap' or 'map', got {EVAL_MODE!r}")
 
-    mean0 = jnp.asarray(init_surface_b.dofs, dtype=jnp.float64)
+    mean0 = jnp.asarray(init_surface.dofs, dtype=jnp.float64)
     es = CMA_ES(population_size=POPSIZE, solution=jnp.zeros((n_dofs,)))
     params = es.default_params.replace(std_init=float(STD_INIT))
     key = jax.random.PRNGKey(SEED)
@@ -184,7 +245,7 @@ def main() -> None:
         hist_best_dofs.append(best_dofs)
 
         if SAVE_EVERY > 0 and (gen + 1) % SAVE_EVERY == 0:
-            surf = make_surface_b(jnp.asarray(best_dofs))
+            surf = make_surface(jnp.asarray(best_dofs))
             to_vtk(surf, OUTDIR / f"gen_{gen:04d}")
 
     np.savez(
@@ -197,7 +258,7 @@ def main() -> None:
         best_dofs=np.asarray(hist_best_dofs, dtype=np.float64),
     )
 
-    best_surf = make_surface_b(jnp.asarray(hist_best_dofs[-1]))
+    best_surf = make_surface(jnp.asarray(hist_best_dofs[-1]))
     written = to_vtk(best_surf, OUTDIR / "best")
     print(f"Wrote {OUTDIR / 'history.npz'}")
     print(f"Wrote {written}")
